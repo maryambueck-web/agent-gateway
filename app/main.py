@@ -12,6 +12,8 @@ from pydantic import ValidationError
 
 from app.adapters.telegram import parse_update, send_text
 from app.agent.orchestrator import respond
+from app.collectors.entra_signins import get_recent_sign_ins
+from app.collectors.signin_rules import evaluate_sign_in_rules
 from app.config import Settings
 from app.models import IncomingMessage
 from app.storage.idempotency import (
@@ -224,7 +226,12 @@ def process_message_task(
 		try:
 			history, version = load_history(message, settings)
 			history.append({"role": "user", "content": _agent_message_content(message)})
-			response = respond(history, settings)
+			entra_signins = None
+			sign_in_findings = None
+			if message.text.strip().casefold().startswith("/signins"):
+				entra_signins = get_recent_sign_ins(settings)
+				sign_in_findings = evaluate_sign_in_rules(entra_signins)
+			response = respond(history, settings, entra_signins, sign_in_findings)
 			history.append({"role": "assistant", "content": response})
 			if not save_response(
 				message,

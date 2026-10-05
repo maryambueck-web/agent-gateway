@@ -1,4 +1,4 @@
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, TypeAdapter
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,7 +10,9 @@ class Settings(BaseSettings):
 	)
 
 	drive_mcp_enabled: bool = False
-	drive_mcp_url: AnyHttpUrl = "https://drivemcp.googleapis.com/mcp/v1"
+	drive_mcp_url: AnyHttpUrl = TypeAdapter(AnyHttpUrl).validate_python(
+		"https://drivemcp.googleapis.com/mcp/v1"
+	)
 	telegram_bot_token: str = ""
 	telegram_webhook_secret: str = ""
 	telegram_allowed_user_ids: str = ""
@@ -26,8 +28,11 @@ class Settings(BaseSettings):
 	conversation_collection: str = "conversations"
 	conversation_history_limit: int = 40
 	anthropic_api_key: str = ""
-	anthropic_model: str = "claude-sonnet-4-20250514"
+	anthropic_model: str = "claude-sonnet-4-6"
 	anthropic_max_tokens: int = 1024
+	azure_tenant_id: str = ""
+	azure_client_id: str = ""
+	azure_client_secret: str = ""
 
 	@property
 	def active_drive_mcp_url(self) -> str | None:
