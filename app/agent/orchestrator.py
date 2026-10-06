@@ -1,9 +1,14 @@
 import json
+import logging
 from typing import Any
 
 from anthropic import Anthropic
 
+from app.agent.explanation_validator import build_safe_report, validate_explanation
 from app.config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def respond(
@@ -45,4 +50,16 @@ def respond(
 	)
 	if not response:
 		raise RuntimeError("The agent returned no text response")
+	if entra_signins is not None:
+		validation_errors = validate_explanation(
+			response,
+			sign_in_findings or [],
+			entra_signins,
+		)
+		if validation_errors:
+			logger.warning(
+				"Rejected Claude sign-in explanation: %s",
+				", ".join(validation_errors),
+			)
+			return build_safe_report(sign_in_findings or [])
 	return response

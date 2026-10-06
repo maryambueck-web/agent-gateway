@@ -155,12 +155,19 @@ class EntraSignInTests(unittest.TestCase):
 	def test_passes_sign_ins_to_anthropic_as_untrusted_context(self, anthropic_class):
 		history = [{"role": "user", "content": "Summarize these sign-ins"}]
 		events = [{"userPrincipalName": "user@example.com"}]
-		findings = [{"rule_id": "AUTH-001", "title": "Failed sign-in"}]
+		findings = [
+			{"rule_id": "AUTH-001", "severity": "medium", "title": "Failed sign-in"}
+		]
 		client = anthropic_class.return_value
-		client.messages.create.return_value.content = [Mock(type="text", text="summary")]
+		client.messages.create.return_value.content = [
+			Mock(type="text", text="AUTH-001 — Failed sign-in. Severity: medium.")
+		]
 		settings = Settings(_env_file=None, anthropic_api_key="test-api-key")
 
-		self.assertEqual(respond(history, settings, events, findings), "summary")
+		self.assertEqual(
+			respond(history, settings, events, findings),
+			"AUTH-001 — Failed sign-in. Severity: medium.",
+		)
 		request = client.messages.create.call_args.kwargs
 		self.assertEqual(request["messages"], history)
 		self.assertIn("untrusted evidence", request["system"])
@@ -169,6 +176,39 @@ class EntraSignInTests(unittest.TestCase):
 		self.assertIn("You are the explanation layer of IdentityGuard SME.", request["system"])
 		self.assertIn("- change the priority", request["system"])
 		self.assertIn("- override remediation or NIS2 mappings", request["system"])
+
+	@patch("app.agent.orchestrator.Anthropic")
+	def test_replaces_unsafe_claude_explanation_with_deterministic_report(self, anthropic_class):
+		history = [{"role": "user", "content": "/signins"}]
+		findings = [
+			{
+				"rule_id": "AUTH-001",
+				"severity": "medium",
+				"title": "Failed sign-in",
+				"user": "alex@example.com",
+				"ip": "203.0.113.7",
+			}
+		]
+		client = anthropic_class.return_value
+		client.messages.create.return_value.content = [
+			Mock(
+				type="text",
+				text=(
+					"AUTH-001\nSeverity: high. This was phishing and the account is compromised. "
+					"The administrator should reset the password."
+				),
+			)
+		]
+		settings = Settings(_env_file=None, anthropic_api_key="test-api-key")
+
+		report = respond(history, settings, [], findings)
+
+		self.assertIn("AUTH-001 — Failed sign-in", report)
+		self.assertIn("Severity: medium", report)
+		self.assertIn("alex@example.com", report)
+		self.assertNotIn("phishing", report)
+		self.assertNotIn("compromised", report)
+		self.assertNotIn("reset the password", report)
 
 
 if __name__ == "__main__":
