@@ -151,7 +151,7 @@ def telegram_webhook(
 	try:
 		claim_status, owner = claim_update(message.idempotency_key, settings)
 	except Exception as error:
-		logger.exception("Failed to claim Telegram update")
+		logger.exception("Unable to record Telegram update")
 		raise HTTPException(status_code=503, detail="Unable to record Telegram update") from error
 
 	if claim_status == "enqueued":
@@ -169,7 +169,7 @@ def telegram_webhook(
 				release_update_claim(message.idempotency_key, owner, settings)
 			except Exception:
 				logger.exception("Failed to release rate-limited Telegram update claim")
-		logger.exception("Failed to apply Telegram rate limit")
+		logger.exception("Unable to apply Telegram rate limit")
 		raise HTTPException(status_code=503, detail="Unable to apply Telegram rate limit") from error
 
 	try:
@@ -184,7 +184,7 @@ def telegram_webhook(
 				release_update_claim(message.idempotency_key, owner, settings)
 			except Exception:
 				logger.exception("Failed to release Telegram update claim")
-		logger.exception("Failed to enqueue Telegram update")
+		logger.exception("Unable to enqueue Telegram update")
 		raise HTTPException(status_code=503, detail="Unable to enqueue Telegram update") from error
 
 	return {"ok": True}
