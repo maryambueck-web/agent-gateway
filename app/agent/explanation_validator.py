@@ -35,6 +35,9 @@ LABEL_PATTERN = re.compile(
 NIS2_MAPPING_PATTERN = re.compile(
 	r"\bNIS2\s+(?:article|art\.?\s*)\s*\d+(?:\.\d+)*\b", re.IGNORECASE
 )
+NIS2_AREA_PATTERN = re.compile(
+	r"\bNIS2\s+areas?\s*(?::|=|are|include(?:d)?)\s*([^\n.!?]+)", re.IGNORECASE
+)
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 IPV4_PATTERN = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 USER_LABEL_PATTERN = re.compile(
@@ -44,7 +47,7 @@ LOCATION_LABEL_PATTERN = re.compile(
 	r"\b(?:location|city|country)\s*[:=]\s*([^\n,;|]+)", re.IGNORECASE
 )
 LOCATION_PHRASE_PATTERN = re.compile(
-	r"\b(?:from|in|near|located in)\s+([A-Z][A-Za-z-]*(?:\s+[A-Z][A-Za-z-]*)?)"
+	r"\b(?:from|in|near|located in)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"
 )
 SENTENCE_PATTERN = re.compile(r"[^\n.!?]+(?:[.!?]+|$)")
 
@@ -64,11 +67,21 @@ def _canonical(value: str) -> str:
 	return " ".join(value.casefold().strip(" \t\r\n.,;:!?*`_-").split())
 
 
-def _approved_values(findings: list[dict[str, Any]], field: str) -> set[str]:
+def _finding_records(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	records: list[dict[str, Any]] = []
+	for finding in findings:
+		records.append(finding)
+		evidence = finding.get("evidence")
+		if isinstance(evidence, dict):
+			records.append(evidence)
+	return records
+
+
+def _approved_values(records: list[dict[str, Any]], field: str) -> set[str]:
 	return {
 		_canonical(value)
-		for finding in findings
-		for value in _text_values(finding.get(field))
+		for record in records
+		for value in _text_values(record.get(field))
 		if value.strip()
 	}
 
@@ -86,7 +99,6 @@ def _extract_ips(text: str) -> set[str]:
 def validate_explanation(
 	text: str,
 	findings: list[dict[str, Any]],
-	events: list[dict[str, Any]],
 ) -> tuple[str, ...]:
 	reasons: set[str] = set()
 	if ATTACK_NAME_PATTERN.search(text):
@@ -96,12 +108,12 @@ def validate_explanation(
 	if ATTACKER_INTENT_PATTERN.search(text):
 		reasons.add("attacker_intent")
 
-	all_records = [*findings, *events]
-	allowed_users = _approved_values(all_records, "user")
-	allowed_ips = _approved_values(all_records, "ip")
+	records = _finding_records(findings)
+	allowed_users = _approved_values(records, "user")
+	allowed_ips = _approved_values(records, "ip")
 	allowed_locations = {
 		_canonical(value)
-		for record in all_records
+		for record in records
 		for field in ("city", "country", "location")
 		for value in _text_values(record.get(field))
 		if value.strip()
@@ -144,6 +156,10 @@ def validate_explanation(
 	for mapping in NIS2_MAPPING_PATTERN.findall(text):
 		if _canonical(mapping) not in approved_mappings:
 			reasons.add("changed_nis2_mapping")
+	for area_clause in NIS2_AREA_PATTERN.findall(text):
+		areas = re.split(r"\s*(?:,|;|\band\b)\s*", area_clause, flags=re.IGNORECASE)
+		if any(_canonical(area) not in approved_mappings for area in areas if _canonical(area)):
+			reasons.add("changed_nis2_mapping")
 
 	findings_by_rule = {
 		str(finding.get("rule_id", "")).casefold(): finding for finding in findings
@@ -182,41 +198,65 @@ def validate_explanation(
 	return tuple(sorted(reasons))
 
 
-def build_safe_report(findings: list[dict[str, Any]]) -> str:
+def format_security_report(
+	findings: list[dict[str, Any]],
+	explanation: str | None = None,
+) -> str:
+	lines = ["🛡 IdentityGuard SME"]
 	if not findings:
-		return "No deterministic finding was supplied. No Claude explanation is available."
+		lines.extend(["", "No security findings from recent Entra sign-ins."])
+	else:
+		findings_by_rule: dict[str, list[dict[str, Any]]] = {}
+		for finding in findings:
+			findings_by_rule.setdefault(str(finding.get("rule_id", "Unknown rule")), []).append(finding)
 
-	lines = ["IdentityGuard SME — Deterministic report"]
-	for finding in findings:
-		lines.append("")
-		lines.append(
-			"{} — {}".format(
-				finding.get("rule_id", "Unknown rule"),
-				finding.get("title", "Finding"),
+		for rule_id, rule_findings in findings_by_rule.items():
+			first = rule_findings[0]
+			lines.extend(
+				[
+					"",
+					rule_id,
+					str(first.get("finding", "Security finding")),
+					f"Priority: {first.get('priority', 'UNKNOWN')}",
+				]
+			)
+			if rule_id == "AUTH-002":
+				occurrences = sum(
+					int((finding.get("evidence") or {}).get("count", 0))
+					for finding in rule_findings
+				)
+			else:
+				occurrences = len(rule_findings)
+			lines.append(f"Occurrences: {occurrences}")
+
+		if explanation:
+			lines.extend(["", "Explanation:", explanation.strip()])
+
+		actions = list(
+			dict.fromkeys(
+				str(action)
+				for finding in findings
+				for action in (finding.get("remediation") or [])
+				if action
 			)
 		)
-		for field, label in (
-			("severity", "Severity"),
-			("priority", "Priority"),
-			("user", "User"),
-			("timestamp", "Timestamp"),
-			("ip", "IP"),
-			("country", "Country"),
-			("city", "City"),
-			("app", "App"),
-			("count", "Count"),
-			("window_minutes", "Window minutes"),
-			("device_managed", "Device managed"),
-			("device_compliant", "Device compliant"),
-			("conditional_access_status", "Conditional Access status"),
-			("nis2_mapping", "NIS2 mapping"),
-			("remediation", "Approved remediation"),
-		):
-			value = finding.get(field)
-			if value is not None:
-				lines.append(f"{label}: {value}")
-		if not finding.get("remediation"):
-			lines.append("Approved remediation: Not supplied by the deterministic finding.")
-		if not any("nis2" in key.casefold() for key in finding):
-			lines.append("NIS2 mapping: Not supplied by the deterministic finding.")
+		areas = list(
+			dict.fromkeys(
+				str(area)
+				for finding in findings
+				for area in (finding.get("nis2_area") or [])
+				if area
+			)
+		)
+		if actions:
+			lines.extend(["", "Recommended actions:"])
+			lines.extend(f"• {action}" for action in actions)
+		if areas:
+			lines.extend(["", "NIS2 areas:"])
+			lines.extend(f"• {area}" for area in areas)
+		lines.extend(["", f'Ask: "Explain {findings[0].get("rule_id", "the finding")}"'])
 	return "\n".join(lines)
+
+
+def build_safe_report(findings: list[dict[str, Any]]) -> str:
+	return format_security_report(findings)

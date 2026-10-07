@@ -154,28 +154,55 @@ class EntraSignInTests(unittest.TestCase):
 	@patch("app.agent.orchestrator.Anthropic")
 	def test_passes_sign_ins_to_anthropic_as_untrusted_context(self, anthropic_class):
 		history = [{"role": "user", "content": "Summarize these sign-ins"}]
-		events = [{"userPrincipalName": "user@example.com"}]
-		findings = [
-			{"rule_id": "AUTH-001", "severity": "medium", "title": "Failed sign-in"}
-		]
+		findings = [{
+			"rule_id": "AUTH-001",
+			"finding": "Failed sign-in",
+			"priority": "MEDIUM",
+			"evidence": {"user": "user@example.com", "result": "failure"},
+			"remediation": ["Verify whether the user attempted this login"],
+			"nis2_area": ["Access control"],
+		}]
 		client = anthropic_class.return_value
 		client.messages.create.return_value.content = [
-			Mock(type="text", text="AUTH-001 — Failed sign-in. Severity: medium.")
+			Mock(type="text", text="AUTH-001 — Failed sign-in. Priority: MEDIUM.")
 		]
 		settings = Settings(_env_file=None, anthropic_api_key="test-api-key")
 
-		self.assertEqual(
-			respond(history, settings, events, findings),
-			"AUTH-001 — Failed sign-in. Severity: medium.",
-		)
+		report = respond(history, settings, findings)
+		self.assertIn("🛡 IdentityGuard SME", report)
+		self.assertIn("Explanation:\nAUTH-001 — Failed sign-in. Priority: MEDIUM.", report)
+		self.assertIn("Recommended actions:", report)
+		self.assertIn("NIS2 areas:", report)
 		request = client.messages.create.call_args.kwargs
 		self.assertEqual(request["messages"], history)
-		self.assertIn("untrusted evidence", request["system"])
+		self.assertIn("only deterministic security findings", request["system"])
 		self.assertIn("user@example.com", request["system"])
 		self.assertIn("AUTH-001", request["system"])
+		self.assertIn('"finding": "Failed sign-in"', request["system"])
+		self.assertIn('"priority": "MEDIUM"', request["system"])
+		self.assertNotIn("userPrincipalName", request["system"])
+		self.assertNotIn('"events"', request["system"])
 		self.assertIn("You are the explanation layer of IdentityGuard SME.", request["system"])
 		self.assertIn("- change the priority", request["system"])
 		self.assertIn("- override remediation or NIS2 mappings", request["system"])
+
+	@patch("app.agent.orchestrator.Anthropic")
+	def test_identityguard_scope_applies_without_signin_data(self, anthropic_class):
+		greeting = (
+			"I'm IdentityGuard SME. I can analyze Microsoft Entra sign-in findings and "
+			"explain the security risks and recommended actions."
+		)
+		client = anthropic_class.return_value
+		client.messages.create.return_value.content = [Mock(type="text", text=greeting)]
+		settings = Settings(_env_file=None, anthropic_api_key="test-api-key")
+
+		self.assertEqual(
+			respond([{"role": "user", "content": "hello"}], settings),
+			greeting,
+		)
+		request = client.messages.create.call_args.kwargs
+		self.assertIn("You are IdentityGuard SME, not a generic chatbot.", request["system"])
+		self.assertIn(greeting, request["system"])
 
 	@patch("app.agent.orchestrator.Anthropic")
 	def test_replaces_unsafe_claude_explanation_with_deterministic_report(self, anthropic_class):
@@ -183,10 +210,15 @@ class EntraSignInTests(unittest.TestCase):
 		findings = [
 			{
 				"rule_id": "AUTH-001",
-				"severity": "medium",
-				"title": "Failed sign-in",
-				"user": "alex@example.com",
-				"ip": "203.0.113.7",
+				"finding": "Failed sign-in",
+				"priority": "MEDIUM",
+				"evidence": {
+					"user": "alex@example.com",
+					"ip": "203.0.113.7",
+					"result": "failure",
+				},
+				"remediation": ["Verify whether the user attempted this login"],
+				"nis2_area": ["Access control"],
 			}
 		]
 		client = anthropic_class.return_value
@@ -194,18 +226,18 @@ class EntraSignInTests(unittest.TestCase):
 			Mock(
 				type="text",
 				text=(
-					"AUTH-001\nSeverity: high. This was phishing and the account is compromised. "
+					"AUTH-001\nPriority: HIGH. This was phishing and the account is compromised. "
 					"The administrator should reset the password."
 				),
 			)
 		]
 		settings = Settings(_env_file=None, anthropic_api_key="test-api-key")
 
-		report = respond(history, settings, [], findings)
+		report = respond(history, settings, findings)
 
-		self.assertIn("AUTH-001 — Failed sign-in", report)
-		self.assertIn("Severity: medium", report)
-		self.assertIn("alex@example.com", report)
+		self.assertIn("AUTH-001\nFailed sign-in", report)
+		self.assertIn("Priority: MEDIUM", report)
+		self.assertNotIn("alex@example.com", report)
 		self.assertNotIn("phishing", report)
 		self.assertNotIn("compromised", report)
 		self.assertNotIn("reset the password", report)

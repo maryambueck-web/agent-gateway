@@ -21,7 +21,15 @@ class SignInRuleTests(unittest.TestCase):
 		findings = evaluate_sign_in_rules([sign_in()])
 
 		self.assertEqual([finding["rule_id"] for finding in findings], ["AUTH-001"])
-		self.assertEqual(findings[0]["user"], "user@example.com")
+		self.assertEqual(
+			set(findings[0]),
+			{"rule_id", "finding", "priority", "evidence", "remediation", "nis2_area"},
+		)
+		self.assertEqual(findings[0]["finding"], "Failed sign-in")
+		self.assertEqual(findings[0]["priority"], "MEDIUM")
+		self.assertEqual(findings[0]["evidence"]["user"], "user@example.com")
+		self.assertEqual(findings[0]["evidence"]["result"], "failure")
+		self.assertEqual(findings[0]["nis2_area"], ["Access control", "Incident handling"])
 
 	def test_auth_002_flags_three_failures_for_same_user_and_ip_within_five_minutes(self):
 		events = [
@@ -34,8 +42,8 @@ class SignInRuleTests(unittest.TestCase):
 		repeated = [finding for finding in findings if finding["rule_id"] == "AUTH-002"]
 
 		self.assertEqual(len(repeated), 1)
-		self.assertEqual(repeated[0]["count"], 3)
-		self.assertEqual(repeated[0]["window_minutes"], 5)
+		self.assertEqual(repeated[0]["evidence"]["count"], 3)
+		self.assertEqual(repeated[0]["evidence"]["window_minutes"], 5)
 
 	def test_auth_002_requires_matching_user_ip_and_window(self):
 		events = [
@@ -64,7 +72,10 @@ class SignInRuleTests(unittest.TestCase):
 
 		self.assertEqual(len(device_findings), 2)
 		self.assertEqual(
-			[(finding["device_managed"], finding["device_compliant"]) for finding in device_findings],
+			[
+				(finding["evidence"]["device_managed"], finding["evidence"]["device_compliant"])
+				for finding in device_findings
+			],
 			[(False, True), (True, False)],
 		)
 

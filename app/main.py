@@ -28,6 +28,21 @@ from app.storage.sessions import consume_user_rate_limit, load_history, save_res
 
 
 logger = logging.getLogger(__name__)
+SIGNINS_COMMAND = "/signins"
+SECURITY_COMMANDS = {
+	"/signins",
+	"security",
+	"check signins",
+	"show findings",
+	"security report",
+}
+HELP_COMMANDS = {"/help", "/start"}
+HELP_RESPONSE = (
+	"IdentityGuard SME\n\n"
+	"Commands:\n"
+	"/signins - analyze recent Entra sign-ins\n"
+	"/help - show available commands"
+)
 app = FastAPI()
 
 
@@ -106,6 +121,20 @@ def _verify_cloud_tasks_request(
 def _agent_message_content(message: IncomingMessage) -> str:
 	attachment_notes = [f"[User attached {attachment.kind}]" for attachment in message.attachments]
 	return "\n".join(part for part in [message.text, *attachment_notes] if part)
+
+
+def _telegram_command(text: str) -> str | None:
+	command = text.strip().split(maxsplit=1)
+	if not command or not command[0].startswith("/"):
+		return None
+	return command[0].split("@", maxsplit=1)[0].casefold()
+
+
+def _is_security_command(text: str) -> bool:
+	normalized = " ".join(text.casefold().split())
+	if normalized in SECURITY_COMMANDS:
+		return True
+	return " " not in normalized and normalized.startswith(f"{SIGNINS_COMMAND}@")
 
 
 def _send_response(message: IncomingMessage, response: str) -> None:
@@ -226,12 +255,15 @@ def process_message_task(
 		try:
 			history, version = load_history(message, settings)
 			history.append({"role": "user", "content": _agent_message_content(message)})
-			entra_signins = None
-			sign_in_findings = None
-			if message.text.strip().casefold().startswith("/signins"):
-				entra_signins = get_recent_sign_ins(settings)
-				sign_in_findings = evaluate_sign_in_rules(entra_signins)
-			response = respond(history, settings, entra_signins, sign_in_findings)
+			command = _telegram_command(message.text)
+			if command in HELP_COMMANDS:
+				response = HELP_RESPONSE
+			elif _is_security_command(message.text):
+				normalized_events = get_recent_sign_ins(settings)
+				security_findings = evaluate_sign_in_rules(normalized_events)
+				response = respond(history, settings, security_findings)
+			else:
+				response = HELP_RESPONSE
 			history.append({"role": "assistant", "content": response})
 			if not save_response(
 				message,

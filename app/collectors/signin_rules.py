@@ -4,6 +4,7 @@ from typing import Any
 
 AUTH_FAILURE_THRESHOLD = 3
 AUTH_FAILURE_WINDOW = timedelta(minutes=5)
+NIS2_SECURITY_AREAS = ["Access control", "Incident handling"]
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -16,6 +17,10 @@ def _parse_timestamp(value: Any) -> datetime | None:
 	if timestamp.tzinfo is None:
 		return timestamp.replace(tzinfo=timezone.utc)
 	return timestamp.astimezone(timezone.utc)
+
+
+def _evidence(event: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+	return {field: event[field] for field in fields if field in event}
 
 
 def evaluate_sign_in_rules(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -31,11 +36,17 @@ def evaluate_sign_in_rules(events: list[dict[str, Any]]) -> list[dict[str, Any]]
 			findings.append(
 				{
 					"rule_id": "AUTH-001",
-					"severity": "medium",
-					"title": "Failed sign-in",
-					"user": user,
-					"ip": ip,
-					"timestamp": timestamp,
+					"finding": "Failed sign-in",
+					"priority": "MEDIUM",
+					"evidence": _evidence(
+						event,
+						("user", "timestamp", "ip", "country", "city", "app", "result", "conditional_access_status"),
+					),
+					"remediation": [
+						"Verify whether the user attempted this login",
+						"Review recent authentication activity",
+					],
+					"nis2_area": NIS2_SECURITY_AREAS.copy(),
 				}
 			)
 
@@ -46,13 +57,20 @@ def evaluate_sign_in_rules(events: list[dict[str, Any]]) -> list[dict[str, Any]]
 			findings.append(
 				{
 					"rule_id": "DEVICE-001",
-					"severity": "high",
-					"title": "Successful sign-in from an unmanaged or non-compliant device",
-					"user": user,
-					"ip": ip,
-					"timestamp": timestamp,
-					"device_managed": event.get("device_managed"),
-					"device_compliant": event.get("device_compliant"),
+					"finding": "Successful sign-in from an unmanaged or non-compliant device",
+					"priority": "HIGH",
+					"evidence": _evidence(
+						event,
+						(
+							"user", "timestamp", "ip", "country", "city", "app", "result",
+							"device_managed", "device_compliant", "conditional_access_status",
+						),
+					),
+					"remediation": [
+						"Verify the sign-in with the user",
+						"Review device management and compliance before allowing future access",
+					],
+					"nis2_area": NIS2_SECURITY_AREAS.copy(),
 				}
 			)
 
@@ -83,14 +101,22 @@ def evaluate_sign_in_rules(events: list[dict[str, Any]]) -> list[dict[str, Any]]
 				findings.append(
 					{
 						"rule_id": "AUTH-002",
-						"severity": "high",
-						"title": "Repeated failed sign-ins from the same user and IP",
-						"user": user,
-						"ip": ip,
-						"count": len(burst),
-						"window_minutes": int(AUTH_FAILURE_WINDOW.total_seconds() // 60),
-						"start_time": burst[0][1].get("timestamp"),
-						"end_time": burst[-1][1].get("timestamp"),
+						"finding": "Repeated failed sign-ins for the same user and IP",
+						"priority": "HIGH",
+						"evidence": {
+							"user": user,
+							"ip": ip,
+							"result": "failure",
+							"count": len(burst),
+							"window_minutes": int(AUTH_FAILURE_WINDOW.total_seconds() // 60),
+							"start_time": burst[0][1].get("timestamp"),
+							"end_time": burst[-1][1].get("timestamp"),
+						},
+						"remediation": [
+							"Confirm the repeated attempts with the user",
+							"Review authentication activity for this account and IP",
+						],
+						"nis2_area": NIS2_SECURITY_AREAS.copy(),
 					}
 				)
 				start = end + 1
@@ -98,11 +124,16 @@ def evaluate_sign_in_rules(events: list[dict[str, Any]]) -> list[dict[str, Any]]
 				start += 1
 
 	findings.sort(
-		key=lambda finding: (
-			finding["rule_id"],
-			finding.get("user") or "",
-			finding.get("ip") or "",
-			finding.get("timestamp") or finding.get("start_time") or "",
-		)
+		key=lambda finding: _finding_sort_key(finding)
 	)
 	return findings
+
+
+def _finding_sort_key(finding: dict[str, Any]) -> tuple[str, str, str, str]:
+	evidence = finding.get("evidence") or {}
+	return (
+		finding["rule_id"],
+		evidence.get("user") or "",
+		evidence.get("ip") or "",
+		evidence.get("timestamp") or evidence.get("start_time") or "",
+	)

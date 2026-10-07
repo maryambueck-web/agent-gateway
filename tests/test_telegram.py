@@ -195,18 +195,22 @@ class TelegramWebhookTests(unittest.TestCase):
 
 	def test_worker_processes_saves_and_sends_response(self):
 		payload = parse_update(telegram_update()).model_dump(mode="json")
+		payload["text"] = "/signins"
 		seen_histories = []
-		seen_sign_ins = []
+		seen_findings = []
+		security_findings = [{"rule_id": "AUTH-001", "finding": "Failed sign-in"}]
 
-		def generate_response(history, settings, entra_signins, sign_in_findings):
+		def generate_response(history, settings, findings):
 			seen_histories.append(list(history))
-			seen_sign_ins.append(entra_signins)
+			seen_findings.append(findings)
 			return "reply"
 
 		with (
 			patch("app.main._verify_cloud_tasks_request"),
 			patch("app.main.claim_task_processing", return_value=("claimed", "owner", None)),
 			patch("app.main.load_history", return_value=([], 0)),
+			patch("app.main.get_recent_sign_ins", return_value=[{"result": "failure"}]),
+			patch("app.main.evaluate_sign_in_rules", return_value=security_findings),
 			patch("app.main.respond", side_effect=generate_response),
 			patch("app.main.save_response", return_value=True) as save,
 			patch("app.main.send_text") as send,
@@ -217,9 +221,9 @@ class TelegramWebhookTests(unittest.TestCase):
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(
 			seen_histories[0],
-			[{"role": "user", "content": "hello"}],
+			[{"role": "user", "content": "/signins"}],
 		)
-		self.assertEqual(seen_sign_ins, [None])
+		self.assertEqual(seen_findings, [security_findings])
 		self.assertEqual(save.call_args.args[1][-1], {"role": "assistant", "content": "reply"})
 		send.assert_called_once_with("456", "reply")
 		complete.assert_called_once_with("789", "owner", self.settings)
@@ -227,13 +231,14 @@ class TelegramWebhookTests(unittest.TestCase):
 	def test_signins_command_fetches_graph_data_and_passes_it_to_orchestrator(self):
 		payload = parse_update(telegram_update()).model_dump(mode="json")
 		payload["text"] = "/signins"
-		sign_in_events = [{"userPrincipalName": "user@example.com"}]
+		normalized_events = [{"user": "user@example.com", "result": "failure"}]
+		security_findings = [{"rule_id": "AUTH-001", "finding": "Failed sign-in"}]
 		with (
 			patch("app.main._verify_cloud_tasks_request"),
 			patch("app.main.claim_task_processing", return_value=("claimed", "owner", None)),
 			patch("app.main.load_history", return_value=([], 0)),
-			patch("app.main.evaluate_sign_in_rules") as evaluate_rules,
-			patch("app.main.get_recent_sign_ins", return_value=sign_in_events) as get_sign_ins,
+			patch("app.main.evaluate_sign_in_rules", return_value=security_findings) as evaluate_rules,
+			patch("app.main.get_recent_sign_ins", return_value=normalized_events) as get_sign_ins,
 			patch("app.main.respond", return_value="reply") as respond_agent,
 			patch("app.main.save_response", return_value=True),
 			patch("app.main.send_text"),
@@ -243,9 +248,79 @@ class TelegramWebhookTests(unittest.TestCase):
 
 		self.assertEqual(response.status_code, 200)
 		get_sign_ins.assert_called_once_with(self.settings)
-		evaluate_rules.assert_called_once_with(sign_in_events)
-		self.assertEqual(respond_agent.call_args.args[2], sign_in_events)
-		self.assertEqual(respond_agent.call_args.args[3], evaluate_rules.return_value)
+		evaluate_rules.assert_called_once_with(normalized_events)
+		self.assertEqual(evaluate_rules.return_value, security_findings)
+		self.assertEqual(respond_agent.call_args.args[2], security_findings)
+		self.assertNotIn("userPrincipalName", str(respond_agent.call_args))
+
+	def test_security_phrases_route_to_signin_analysis(self):
+		for phrase in (
+			"/signins",
+			"security",
+			"check signins",
+			"show findings",
+			"security report",
+		):
+			with self.subTest(phrase=phrase):
+				payload = parse_update(telegram_update()).model_dump(mode="json")
+				payload["text"] = phrase
+				with (
+					patch("app.main._verify_cloud_tasks_request"),
+					patch("app.main.claim_task_processing", return_value=("claimed", "owner", None)),
+					patch("app.main.load_history", return_value=([], 0)),
+					patch("app.main.evaluate_sign_in_rules") as evaluate_rules,
+					patch("app.main.get_recent_sign_ins", return_value=[]) as get_sign_ins,
+					patch("app.main.respond", return_value="reply"),
+					patch("app.main.save_response", return_value=True),
+					patch("app.main.send_text"),
+					patch("app.main.mark_update_completed", return_value=True),
+				):
+					response = self.client.post("/tasks/process-message", json=payload)
+
+				self.assertEqual(response.status_code, 200)
+				get_sign_ins.assert_called_once_with(self.settings)
+				evaluate_rules.assert_called_once_with([])
+
+	def test_unmatched_messages_return_help_without_graph_or_llm(self):
+		for phrase in ("hello", "show me my sign-ins", "security report please", "/signins-extra"):
+			with self.subTest(phrase=phrase):
+				payload = parse_update(telegram_update()).model_dump(mode="json")
+				payload["text"] = phrase
+				with (
+					patch("app.main._verify_cloud_tasks_request"),
+					patch("app.main.claim_task_processing", return_value=("claimed", "owner", None)),
+					patch("app.main.load_history", return_value=([], 0)),
+					patch("app.main.get_recent_sign_ins") as get_sign_ins,
+					patch("app.main.respond", return_value="IdentityGuard scope") as respond_agent,
+					patch("app.main.save_response", return_value=True),
+					patch("app.main.send_text") as send,
+					patch("app.main.mark_update_completed", return_value=True),
+				):
+					response = self.client.post("/tasks/process-message", json=payload)
+
+				self.assertEqual(response.status_code, 200)
+				get_sign_ins.assert_not_called()
+				respond_agent.assert_not_called()
+				self.assertIn("/signins - analyze recent Entra sign-ins", send.call_args.args[1])
+
+	def test_help_command_lists_signins_without_calling_llm(self):
+		payload = parse_update(telegram_update()).model_dump(mode="json")
+		payload["text"] = "/help"
+		with (
+			patch("app.main._verify_cloud_tasks_request"),
+			patch("app.main.claim_task_processing", return_value=("claimed", "owner", None)),
+			patch("app.main.load_history", return_value=([], 0)),
+			patch("app.main.respond") as respond_agent,
+			patch("app.main.save_response", return_value=True),
+			patch("app.main.send_text") as send,
+			patch("app.main.mark_update_completed", return_value=True),
+		):
+			response = self.client.post("/tasks/process-message", json=payload)
+
+		self.assertEqual(response.status_code, 200)
+		respond_agent.assert_not_called()
+		for phrase in ("/signins", "/help"):
+			self.assertIn(phrase, send.call_args.args[1])
 
 	def test_worker_retry_reuses_saved_response_without_calling_agent(self):
 		payload = parse_update(telegram_update()).model_dump(mode="json")
