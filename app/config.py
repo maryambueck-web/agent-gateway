@@ -1,4 +1,4 @@
-from pydantic import AnyHttpUrl, TypeAdapter
+from pydantic import AliasChoices, AnyHttpUrl, Field, TypeAdapter
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,18 @@ class Settings(BaseSettings):
 	telegram_bot_token: str = ""
 	telegram_webhook_secret: str = ""
 	telegram_allowed_user_ids: str = ""
+	whatsapp_app_secret: str = ""
+	whatsapp_verify_token: str = ""
+	whatsapp_access_token: str = ""
+	whatsapp_phone_number_id: str = ""
+	whatsapp_allowed_numbers: str = Field(
+		default="",
+		validation_alias=AliasChoices(
+			"WHATSAPP_ALLOWED_NUMBERS",
+			"WHATSAPP_ALLOWED_USER_IDS",
+		),
+	)
+	whatsapp_graph_api_version: str = "v23.0"
 	google_cloud_project_id: str = ""
 	cloud_tasks_location: str = ""
 	cloud_tasks_queue: str = ""
@@ -45,5 +57,13 @@ class Settings(BaseSettings):
 		return frozenset(
 			user_id.strip()
 			for user_id in self.telegram_allowed_user_ids.split(",")
+			if user_id.strip()
+		)
+
+	@property
+	def whatsapp_allowed_user_id_set(self) -> frozenset[str]:
+		return frozenset(
+			user_id.strip().lstrip("+")
+			for user_id in self.whatsapp_allowed_numbers.split(",")
 			if user_id.strip()
 		)

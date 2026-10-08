@@ -3,7 +3,8 @@ import logging
 import secrets
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import tasks_v2
@@ -11,6 +12,9 @@ from google.oauth2 import id_token
 from pydantic import ValidationError
 
 from app.adapters.telegram import parse_update, send_text
+from app.adapters.whatsapp import parse_updates as parse_whatsapp_updates
+from app.adapters.whatsapp import send_text as send_whatsapp_text
+from app.adapters.whatsapp import verify_webhook_signature
 from app.agent.orchestrator import respond
 from app.collectors.entra_signins import get_recent_sign_ins
 from app.collectors.signin_rules import evaluate_sign_in_rules
@@ -79,6 +83,67 @@ def _enqueue_message(message: IncomingMessage, settings: Settings) -> None:
 		pass
 
 
+def _queue_incoming_message(message: IncomingMessage, settings: Settings) -> None:
+	if not all(
+		(
+			settings.google_cloud_project_id,
+			settings.cloud_tasks_location,
+			settings.cloud_tasks_queue,
+			settings.cloud_tasks_target_url,
+			settings.cloud_tasks_service_account_email,
+		)
+	):
+		raise HTTPException(status_code=503, detail="Cloud Tasks is not configured")
+
+	try:
+		claim_status, owner = claim_update(message.idempotency_key, settings)
+	except Exception as error:
+		logger.exception("Unable to record %s update", message.channel)
+		raise HTTPException(
+			status_code=503,
+			detail=f"Unable to record {message.channel} update",
+		) from error
+
+	if claim_status == "enqueued":
+		return
+	if claim_status == "pending":
+		raise HTTPException(status_code=503, detail="Webhook update enqueue is pending")
+
+	try:
+		if not consume_user_rate_limit(message.channel, message.user_id, settings):
+			release_update_claim(message.idempotency_key, owner, settings)
+			return
+	except Exception as error:
+		if owner is not None:
+			try:
+				release_update_claim(message.idempotency_key, owner, settings)
+			except Exception:
+				logger.exception("Unable to release rate-limited %s update claim", message.channel)
+		logger.exception("Unable to apply %s rate limit", message.channel)
+		raise HTTPException(
+			status_code=503,
+			detail=f"Unable to apply {message.channel} rate limit",
+		) from error
+
+	try:
+		_enqueue_message(message, settings)
+		if owner is None or not mark_update_enqueued(
+			message.idempotency_key, owner, settings
+		):
+			raise RuntimeError(f"Unable to mark {message.channel} update enqueued")
+	except Exception as error:
+		if owner is not None:
+			try:
+				release_update_claim(message.idempotency_key, owner, settings)
+			except Exception:
+				logger.exception("Unable to release %s update claim", message.channel)
+		logger.exception("Unable to enqueue %s update", message.channel)
+		raise HTTPException(
+			status_code=503,
+			detail=f"Unable to enqueue {message.channel} update",
+		) from error
+
+
 def _verify_cloud_tasks_request(
 	authorization: str | None,
 	settings: Settings,
@@ -141,6 +206,9 @@ def _send_response(message: IncomingMessage, response: str) -> None:
 	if message.channel == "telegram":
 		send_text(message.conversation_id, response)
 		return
+	if message.channel == "whatsapp":
+		send_whatsapp_text(message.conversation_id, response)
+		return
 	raise ValueError(f"Unsupported response channel: {message.channel}")
 
 
@@ -166,56 +234,51 @@ def telegram_webhook(
 		return {"ok": True}
 	if message.user_id not in settings.telegram_allowed_user_id_set:
 		return {"ok": True}
-	if not all(
-		(
-			settings.google_cloud_project_id,
-			settings.cloud_tasks_location,
-			settings.cloud_tasks_queue,
-			settings.cloud_tasks_target_url,
-			settings.cloud_tasks_service_account_email,
-		)
+	_queue_incoming_message(message, settings)
+
+	return {"ok": True}
+
+
+@app.get("/webhooks/whatsapp")
+def verify_whatsapp_webhook(
+	hub_mode: str = Query(default="", alias="hub.mode"),
+	hub_verify_token: str = Query(default="", alias="hub.verify_token"),
+	hub_challenge: str = Query(default="", alias="hub.challenge"),
+) -> PlainTextResponse:
+	settings = Settings()
+	if not settings.whatsapp_verify_token:
+		raise HTTPException(status_code=503, detail="WhatsApp webhook is not configured")
+	if hub_mode != "subscribe" or not secrets.compare_digest(
+		hub_verify_token.encode("utf-8"), settings.whatsapp_verify_token.encode("utf-8")
 	):
-		raise HTTPException(status_code=503, detail="Cloud Tasks is not configured")
+		raise HTTPException(status_code=403, detail="Invalid WhatsApp verification token")
+	return PlainTextResponse(hub_challenge)
 
+
+@app.post("/webhooks/whatsapp")
+async def whatsapp_webhook(
+	request: Request,
+	x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+) -> dict[str, bool]:
+	settings = Settings()
+	if not settings.whatsapp_app_secret:
+		raise HTTPException(status_code=503, detail="WhatsApp webhook is not configured")
+	body = await request.body()
+	if not verify_webhook_signature(body, x_hub_signature_256, settings.whatsapp_app_secret):
+		raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook signature")
 	try:
-		claim_status, owner = claim_update(message.idempotency_key, settings)
-	except Exception as error:
-		logger.exception("Unable to record Telegram update")
-		raise HTTPException(status_code=503, detail="Unable to record Telegram update") from error
+		payload = json.loads(body)
+	except (json.JSONDecodeError, UnicodeDecodeError) as error:
+		raise HTTPException(status_code=400, detail="Invalid WhatsApp webhook JSON") from error
+	if not isinstance(payload, dict):
+		raise HTTPException(status_code=400, detail="Invalid WhatsApp webhook payload")
+	if not settings.whatsapp_allowed_user_id_set:
+		raise HTTPException(status_code=503, detail="WhatsApp sender allowlist is not configured")
 
-	if claim_status == "enqueued":
-		return {"ok": True}
-	if claim_status == "pending":
-		raise HTTPException(status_code=503, detail="Telegram update enqueue is pending")
-
-	try:
-		if not consume_user_rate_limit(message.channel, message.user_id, settings):
-			release_update_claim(message.idempotency_key, owner, settings)
-			return {"ok": True}
-	except Exception as error:
-		if owner is not None:
-			try:
-				release_update_claim(message.idempotency_key, owner, settings)
-			except Exception:
-				logger.exception("Failed to release rate-limited Telegram update claim")
-		logger.exception("Unable to apply Telegram rate limit")
-		raise HTTPException(status_code=503, detail="Unable to apply Telegram rate limit") from error
-
-	try:
-		_enqueue_message(message, settings)
-		if owner is None or not mark_update_enqueued(
-			message.idempotency_key, owner, settings
-		):
-			raise RuntimeError("Telegram update claim is no longer owned")
-	except Exception as error:
-		if owner is not None:
-			try:
-				release_update_claim(message.idempotency_key, owner, settings)
-			except Exception:
-				logger.exception("Failed to release Telegram update claim")
-		logger.exception("Unable to enqueue Telegram update")
-		raise HTTPException(status_code=503, detail="Unable to enqueue Telegram update") from error
-
+	for message in parse_whatsapp_updates(payload):
+		if message.user_id.lstrip("+") not in settings.whatsapp_allowed_user_id_set:
+			continue
+		_queue_incoming_message(message, settings)
 	return {"ok": True}
 
 
@@ -230,7 +293,7 @@ def process_message_task(
 		message = IncomingMessage.model_validate(payload)
 	except ValidationError as error:
 		raise HTTPException(status_code=400, detail="Invalid task message") from error
-	if message.channel != "telegram":
+	if message.channel not in {"telegram", "whatsapp"}:
 		raise HTTPException(status_code=400, detail="Unsupported task channel")
 
 	try:
